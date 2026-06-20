@@ -60,7 +60,7 @@ class CubicAnisotropyField:
             print(f"[Cubic] max|u1 . u2| = {np.max(np.abs(dp12)):.3e}", flush=True)
 
         # Prefactor H (A/m)
-        self.pref = (2.0 * self.K1) / (self.mu_0 * self.M_s) if self.M_s != 0.0 else 0.0
+        self.pref = -(2.0 * self.K1) / (self.mu_0 * self.M_s) if self.M_s != 0.0 else 0.0
 
         self.H = fem.Function(V)
         self.HA = self.H.x.array.reshape(-1, 3)
