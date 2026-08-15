@@ -18,6 +18,7 @@ ARG UFL_VERSION=2025.2.0
 ARG FFCX_VERSION=v0.10.1
 
 ARG ADIOS2_VERSION=v2.10.2
+ARG NANOBIND_VERSION=2.12.0
 
 # -----------------------------------------------------------------------------
 # Build control
@@ -60,7 +61,7 @@ ENV OMP_NUM_THREADS=1
 ENV MKL_NUM_THREADS=1
 ENV OPENBLAS_NUM_THREADS=1
 ENV NUMEXPR_NUM_THREADS=1
-ENV NUMBA_NUM_THREADS=1
+ENV NUMBA_NUM_THREADS=2
 ENV VECLIB_MAXIMUM_THREADS=1
 
 # Useful when the MPI stack is not CUDA-aware.
@@ -119,7 +120,8 @@ RUN python3 -m venv ${VIRTUAL_ENV} && \
         numpy \
         scipy \
         pybind11 \
-        nanobind \
+        "nanobind==${NANOBIND_VERSION}" \
+	    "scikit-build-core[pyproject]>=0.10" \
         mpi4py
 
 # -----------------------------------------------------------------------------
