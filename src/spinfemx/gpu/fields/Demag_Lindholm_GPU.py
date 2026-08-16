@@ -1,3 +1,4 @@
+import gc
 import math
 import os
 from pathlib import Path
@@ -31,11 +32,12 @@ try:
         print_hmatrix_summary,
     )
     from .lindholm_hmatrix_gpu.entry_provider import LindholmEntryProviderCPU
+    from .lindholm_hmatrix_gpu.entry_provider_gpu import LindholmEntryProviderGPU
 except ImportError as exc:
     raise ImportError(
-        "No se pudo importar el backend comprimido Lindholm GPU ubicado en "
-        "'fields/lindholm_hmatrix_gpu'. Verifica que la carpeta exista y "
-        "contenga su archivo '__init__.py'."
+    "Could not import the compressed Lindholm GPU backend located in "
+    "'fields/lindholm_hmatrix_gpu'. Verify that the folder exists and "
+    "contains its '__init__.py' file."
     ) from exc
 
 
@@ -124,9 +126,32 @@ class DemagFieldLindholmGPU:
         hmatrix_max_rank=None,
         hmatrix_max_temporary_block_bytes=256 * 1024**2,
         hmatrix_force_rebuild=False,
+        hmatrix_cache_compressed=False,
+        # H-matrix construction backend.  The boundary MatVec remains on GPU
+        # independently of this option.
+        hmatrix_build_backend="gpu",
+        hmatrix_build_device_id=0,
+        hmatrix_build_threads_per_block=128,
+        hmatrix_gpu_entry_kernel="auto",
+        hmatrix_gpu_fast_math=False,
+        hmatrix_gpu_index_cache_max_bytes=128 * 1024**2,
+        hmatrix_gpu_memory_fraction=0.75,
+        hmatrix_gpu_fallback_to_cpu=True,
+        hmatrix_gpu_aca_residual_check_interval=1,
+        hmatrix_gpu_rsvd_initial_rank=16,
+        hmatrix_gpu_rsvd_oversampling=8,
+        hmatrix_gpu_rsvd_power_iterations=1,
+        hmatrix_gpu_progress_interval_seconds=5.0,
+        # Packed far-field MatVec settings.
         hmatrix_threads_per_block=128,
         hmatrix_use_fp32=True,
-        hmatrix_verbose=True,
+        # Stable default: discard transient per-block GPU factors and create
+        # the final packed arrays from the already available host cache copy.
+        # This preserves GPU construction while avoiding retained build-pool
+        # memory before temporal integration.
+        hmatrix_direct_gpu_pack=False,
+        hmatrix_release_build_memory=True,
+        hmatrix_verbose=False,
     ):
         self.mesh = mesh
         self.V = V
@@ -339,15 +364,31 @@ class DemagFieldLindholmGPU:
 
                 eps_tag = f"{float(hmatrix_epsilon):.0e}".replace("+", "")
                 eta_tag = f"{float(hmatrix_eta):g}".replace(".", "p")
+                compressor_tag = (
+                    str(hmatrix_compressor).strip().lower().replace("-", "_")
+                )
+                build_tag = str(hmatrix_build_backend).strip().lower()
 
                 hmatrix_cache_path = cache_root / (
                     f"{mesh_tag}_eps{eps_tag}_eta{eta_tag}_"
-                    f"leaf{int(hmatrix_leaf_size)}.npz"
+                    f"leaf{int(hmatrix_leaf_size)}_{compressor_tag}_{build_tag}.npz"
                 )
 
             self.hmatrix_cache_path = str(Path(hmatrix_cache_path))
 
-            provider = LindholmEntryProviderCPU.from_opB(self.opB)
+            requested_build_backend = str(hmatrix_build_backend).strip().lower()
+            if requested_build_backend == "cpu":
+                provider = LindholmEntryProviderCPU.from_opB(self.opB)
+            else:
+                provider = LindholmEntryProviderGPU.from_opB(
+                    self.opB,
+                    device_id=int(hmatrix_build_device_id),
+                    threads_per_block=int(hmatrix_build_threads_per_block),
+                    kernel_mode=str(hmatrix_gpu_entry_kernel),
+                    fast_math=bool(hmatrix_gpu_fast_math),
+                    index_cache_max_bytes=int(hmatrix_gpu_index_cache_max_bytes),
+                )
+
             config = HMatrixBuildConfig(
                 epsilon=float(hmatrix_epsilon),
                 eta=float(hmatrix_eta),
@@ -356,6 +397,21 @@ class DemagFieldLindholmGPU:
                 max_rank=hmatrix_max_rank,
                 max_temporary_block_bytes=int(
                     hmatrix_max_temporary_block_bytes
+                ),
+                build_backend=requested_build_backend,
+                gpu_device_id=int(hmatrix_build_device_id),
+                gpu_memory_fraction=float(hmatrix_gpu_memory_fraction),
+                gpu_fallback_to_cpu=bool(hmatrix_gpu_fallback_to_cpu),
+                gpu_aca_residual_check_interval=int(
+                    hmatrix_gpu_aca_residual_check_interval
+                ),
+                gpu_rsvd_initial_rank=int(hmatrix_gpu_rsvd_initial_rank),
+                gpu_rsvd_oversampling=int(hmatrix_gpu_rsvd_oversampling),
+                gpu_rsvd_power_iterations=int(
+                    hmatrix_gpu_rsvd_power_iterations
+                ),
+                gpu_progress_interval_seconds=float(
+                    hmatrix_gpu_progress_interval_seconds
                 ),
             )
 
@@ -367,11 +423,12 @@ class DemagFieldLindholmGPU:
                 config=config,
                 force_rebuild=bool(hmatrix_force_rebuild),
                 verbose=bool(hmatrix_verbose),
+                cache_compressed=bool(hmatrix_cache_compressed),
             )
 
-            if hmatrix_verbose:
-                factor_precision = "FP32" if hmatrix_use_fp32 else "FP64"
+            factor_precision = "FP32" if hmatrix_use_fp32 else "FP64"
 
+            if hmatrix_verbose:
                 print(
                     "[Demag Lindholm HMatrixGPU] "
                     f"low-rank factor precision={factor_precision}",
@@ -379,11 +436,49 @@ class DemagFieldLindholmGPU:
                 )
 
 
+            # The GPU builder stores one transient CuPy U/V pair per far
+            # block in ``_gpu_far_blocks``.  Direct packing avoids one host to
+            # device copy, but for large problems it can leave several GiB of
+            # now-unused allocations cached in the CuPy pool immediately before
+            # PETSc TS starts.  The host factors already exist because they are
+            # required by the persistent cache, so the stable default reproduces
+            # the historical packed layout without giving up GPU construction.
+            if not bool(hmatrix_direct_gpu_pack):
+                transient_blocks = getattr(
+                    self.B_hmatrix_cpu,
+                    "_gpu_far_blocks",
+                    None,
+                )
+                if transient_blocks is not None:
+                    cp.cuda.Device().synchronize()
+                    transient_blocks.clear()
+                    try:
+                        delattr(self.B_hmatrix_cpu, "_gpu_far_blocks")
+                    except AttributeError:
+                        pass
+                    gc.collect()
+                    cp.get_default_memory_pool().free_all_blocks()
+                    try:
+                        cp.get_default_pinned_memory_pool().free_all_blocks()
+                    except Exception:
+                        pass
+
             self.B_hmatrix_gpu = HMatrixGPUPackedFused(
                 self.B_hmatrix_cpu,
                 threads_per_block=int(hmatrix_threads_per_block),
                 use_fp32=bool(hmatrix_use_fp32),
             )
+
+            # Complete all packing work before any timing of the temporal
+            # integrator and return free construction blocks to the CUDA driver.
+            cp.cuda.Device().synchronize()
+            if bool(hmatrix_release_build_memory):
+                gc.collect()
+                cp.get_default_memory_pool().free_all_blocks()
+                try:
+                    cp.get_default_pinned_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
 
             if hmatrix_verbose:
                 print_hmatrix_summary(
@@ -392,6 +487,30 @@ class DemagFieldLindholmGPU:
                 )
                 self.B_hmatrix_gpu.print_memory_report(
                     prefix="[Demag Lindholm HMatrixGPU]"
+                )
+            elif self.rank == 0:
+                meta = self.B_hmatrix_cpu.metadata
+                memory = self.B_hmatrix_gpu.memory_report()
+                if meta.get("cache_loaded"):
+                    status = "cache loaded"
+                else:
+                    backend = str(
+                        meta.get("resolved_build_backend", "cpu")
+                    ).upper()
+                    elapsed = float(meta.get("build_time_seconds", 0.0))
+                    status = f"built on {backend} in {elapsed:.2f} s"
+
+                print(
+                    "[Demag Lindholm HMatrixGPU] "
+                    f"{status} | far={len(self.B_hmatrix_cpu.far_blocks):,} | "
+                    f"rank avg/max="
+                    f"{float(meta.get('average_far_rank', 0.0)):.1f}/"
+                    f"{int(meta.get('max_observed_rank', 0))} | "
+                    f"compression="
+                    f"{self.B_hmatrix_cpu.compression_ratio_entries:.2f}x | "
+                    f"{factor_precision} | "
+                    f"GPU={memory['accounted_gpu_human']}",
+                    flush=True,
                 )
 
         self.xb_gpu = cp.zeros(self.opB.Nb, dtype=self.B_dtype)
@@ -420,7 +539,9 @@ class DemagFieldLindholmGPU:
         # result in the original global boundary ordering.
         self.y_rows_gpu = cp.empty(self.opB.Nb, dtype=self.B_dtype)
 
-        if self.rank == 0:
+        if self.rank == 0 and (
+            self.boundary_backend == "dense" or hmatrix_verbose
+        ):
             dense_mib = dense_theoretical_bytes / 1024**2
             print(
                 "[Demag Lindholm GPU] "
