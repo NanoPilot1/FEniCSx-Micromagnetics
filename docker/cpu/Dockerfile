@@ -15,6 +15,8 @@ ARG BASIX_VERSION=v0.10.0
 ARG UFL_VERSION=2025.2.0
 ARG FFCX_VERSION=v0.10.1
 
+ARG NANOBIND_VERSION=2.12.0
+
 ARG ADIOS2_VERSION=v2.10.2
 
 # -----------------------------------------------------------------------------
@@ -92,7 +94,8 @@ RUN python3 -m venv ${VIRTUAL_ENV} && \
         numpy \
         scipy \
         pybind11 \
-        nanobind \
+        "nanobind==${NANOBIND_VERSION}" \
+	"scikit-build-core[pyproject]>=0.10" \
         mpi4py
 
 # -----------------------------------------------------------------------------
@@ -190,13 +193,14 @@ RUN python -m pip install -r build-requirements.txt && \
         --no-build-isolation \
         .
 
+ARG JAX_VERSION=0.11.0
+ARG JAXFMM_VERSION=0.3.3
+
 # -----------------------------------------------------------------------------
-# Basic scientific Python stack, CPU-only
+# Basic scientific Python stack and CPU JAXFMM
 #
-# No CuPy.
-# No JAX.
-# No jaxfmm.
-# No CUDA packages.
+# JAX is pinned so a clean Docker build does not silently change the FMM
+# numerical/runtime stack. CuPy and CUDA packages remain excluded.
 # -----------------------------------------------------------------------------
 RUN python -m pip install \
     numba \
@@ -205,6 +209,13 @@ RUN python -m pip install \
     matplotlib \
     pyvista \
     bempp-cl
+
+RUN python -m pip install \
+        "jax==${JAX_VERSION}" && \
+    python -m pip install \
+        --no-deps \
+        "jaxfmm==${JAXFMM_VERSION}" && \
+    python -m pip check
 
 # -----------------------------------------------------------------------------
 # ADIOS2 from source with MPI and Python bindings
@@ -258,12 +269,14 @@ print("adios2 file:", getattr(adios2, "__file__", "no __file__"))
 PY
 
 # -----------------------------------------------------------------------------
-# adios4dolfinx against the MPI-enabled ADIOS2 from source
-#
-# --no-deps is intentional. Otherwise pip may install its own adios2 wheel, which
-# may not be MPI-enabled and can shadow the source-built ADIOS2 binding.
+# adios4dolfinx is pinned to the release line compatible with DOLFINx 0.10.
+# ADIOS2 itself is provided by the MPI-enabled source build above.
 # -----------------------------------------------------------------------------
-RUN python -m pip install --no-deps adios4dolfinx
+ARG ADIOS4DOLFINX_VERSION=0.10.0.post1
+
+RUN python -m pip install \
+        "adios4dolfinx==${ADIOS4DOLFINX_VERSION}" && \
+    python -m pip check
 
 # -----------------------------------------------------------------------------
 # ADIOS2/adios4dolfinx build-time test
@@ -332,6 +345,7 @@ print("Final CPU image verification")
 print("====================================")
 
 import sys
+import importlib.metadata as metadata
 print("Python:", sys.version)
 
 import numpy
@@ -341,6 +355,9 @@ import meshio
 import matplotlib
 import numba
 import pyvista
+import jax
+import jaxfmm
+from jaxfmm.apps.mag.strayfield import plan_strayfield
 import adios2
 import adios4dolfinx
 import dolfinx
@@ -353,6 +370,11 @@ print("meshio:", meshio.__version__)
 print("matplotlib:", matplotlib.__version__)
 print("numba:", numba.__version__)
 print("pyvista:", pyvista.__version__)
+print("jax:", jax.__version__)
+print("jax backend:", jax.default_backend())
+print("jax devices:", jax.devices())
+print("jaxfmm:", metadata.version("jaxfmm"))
+assert jax.default_backend() == "cpu"
 print("adios2:", getattr(adios2, "__file__", "no __file__"))
 print("adios4dolfinx:", getattr(adios4dolfinx, "__file__", "no __file__"))
 print("dolfinx:", dolfinx.__version__)
