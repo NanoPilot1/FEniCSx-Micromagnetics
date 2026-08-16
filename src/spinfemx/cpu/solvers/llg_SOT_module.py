@@ -21,6 +21,58 @@ from ..fields.DMI_Interfacial import DMIInterfacial
 
 
 
+
+def _resolve_ksp_pc_configuration(
+    pc_side: str,
+    pc_norm_type: str,
+):
+    """Resolve the Krylov preconditioning side and convergence norm."""
+    side_key = str(pc_side).strip().lower()
+    side_aliases = {
+        "left": "left",
+        "l": "left",
+        "right": "right",
+        "r": "right",
+    }
+    if side_key not in side_aliases:
+        raise ValueError(
+            "pc_side must be 'left' or 'right'. "
+            f"Received {pc_side!r}."
+        )
+    side_key = side_aliases[side_key]
+
+    norm_key = str(pc_norm_type).strip().lower().replace("-", "_")
+    norm_aliases = {
+        "preconditioned": "preconditioned",
+        "pc": "preconditioned",
+        "unpreconditioned": "unpreconditioned",
+        "true": "unpreconditioned",
+        "true_residual": "unpreconditioned",
+    }
+    if norm_key not in norm_aliases:
+        raise ValueError(
+            "pc_norm_type must be 'preconditioned' or 'unpreconditioned'. "
+            f"Received {pc_norm_type!r}."
+        )
+    norm_key = norm_aliases[norm_key]
+
+    if side_key == "right" and norm_key != "unpreconditioned":
+        raise ValueError(
+            "Right-preconditioned GMRES must use the unpreconditioned "
+            "(true) residual norm in this solver."
+        )
+
+    side_value = {
+        "left": PETSc.PC.Side.LEFT,
+        "right": PETSc.PC.Side.RIGHT,
+    }[side_key]
+    norm_value = {
+        "preconditioned": PETSc.KSP.NormType.PRECONDITIONED,
+        "unpreconditioned": PETSc.KSP.NormType.UNPRECONDITIONED,
+    }[norm_key]
+    return side_key, norm_key, side_value, norm_value
+
+
 # Local SOT / LLG kernels
 
 
@@ -272,7 +324,7 @@ class JvContextSOTCPU:
         self.i21 = np.empty(n, dtype=np.float64)
         self.i22 = np.empty(n, dtype=np.float64)
 
-    def update_pc_full_fast(self, shift, use_abs_diag=True, eps_reg=1e-14, det_eps=1e-30):
+    def update_pc_full_fast(self, shift, use_abs_diag=False, eps_reg=1e-14, det_eps=1e-30):
         self.shift = float(shift)
         diagK = self.diagK_abs if use_abs_diag else self.diagK_signed
 
@@ -852,10 +904,23 @@ class LLG_SOT:
         ksp_rtol=1e-4,
         monitor_fn=None,
         pc_python=True,
+        pc_use_abs_diag=False,
+        pc_side="right",
+        pc_norm_type="unpreconditioned",
     ):
         if self.hef is None:
             self._build_effective_field()
         hef = self.hef
+
+        (
+            pc_side_key,
+            pc_norm_key,
+            pc_side_value,
+            pc_norm_value,
+        ) = _resolve_ksp_pc_configuration(
+            pc_side=pc_side,
+            pc_norm_type=pc_norm_type,
+        )
 
         hef.m.x.array[:] = np.asarray(m0_array, dtype=np.float64).reshape(-1)
         hef.m.x.scatter_forward()
@@ -902,7 +967,8 @@ class LLG_SOT:
         J.setPythonContext(ctx)
         J.setUp()
 
-        pc = snes.getKSP().getPC()
+        ksp = snes.getKSP()
+        pc = ksp.getPC()
         if pc_python:
             pc.setType(PETSc.PC.Type.PYTHON)
             pc.setPythonContext(ctx)
@@ -915,7 +981,10 @@ class LLG_SOT:
             hef.m.x.scatter_forward()
             hef.update_jac_state()
             if pc_python:
-                ctx.update_pc_full_fast(shift, use_abs_diag=True)
+                ctx.update_pc_full_fast(
+                    shift,
+                    use_abs_diag=bool(pc_use_abs_diag),
+                )
             else:
                 ctx.shift = float(shift)
             return PETSc.Mat.Structure.SAME_NONZERO_PATTERN
@@ -923,6 +992,21 @@ class LLG_SOT:
         ts.setIFunction(hef.ifunction_SOT)
         ts.setIJacobian(IJac, J)
         ts.setFromOptions()
+
+        # Re-apply the explicit API configuration after setFromOptions(), so
+        # ambient PETSc options cannot silently change the comparison.
+        ksp = ts.getSNES().getKSP()
+        pc = ksp.getPC()
+        if pc_python:
+            ctx.enable_pc = True
+            pc.setType(PETSc.PC.Type.PYTHON)
+            pc.setPythonContext(ctx)
+            ksp.setPCSide(pc_side_value)
+            ksp.setNormType(pc_norm_value)
+        else:
+            ctx.enable_pc = False
+            pc.setType(PETSc.PC.Type.NONE)
+            ksp.setNormType(PETSc.KSP.NormType.UNPRECONDITIONED)
 
         y = hef.m.x.petsc_vec.copy()
         y.ghostUpdate(addv=PETSc.InsertMode.INSERT_VALUES, mode=PETSc.ScatterMode.FORWARD)
@@ -1013,8 +1097,16 @@ class LLG_SOT:
 
         if self.mesh.comm.rank == 0:
             print(f"\n  ts.solve : {elapsed:.3f} s")
-            print(f"  Jacobian matvec calls : {ctx.calls}")
-            print(f"  PC applications       : {ctx.callsPre}")
+            print(f"  accepted steps         : {ts.getStepNumber()}")
+            print(f"  rejected steps         : {ts.getStepRejections()}")
+            print(f"  SNES failures          : {ts.getSNESFailures()}")
+            print(f"  SNES iterations        : {ts.getSNESIterations()}")
+            print(f"  KSP iterations         : {ts.getKSPIterations()}")
+            print(f"  Jacobian matvec calls  : {ctx.calls}")
+            print(f"  PC applications        : {ctx.callsPre}")
+            print(f"  PC side                : {pc_side_key if pc_python else 'none'}")
+            print(f"  KSP norm               : {pc_norm_key if pc_python else 'unpreconditioned'}")
+            print(f"  PC abs(diag)           : {bool(pc_use_abs_diag) if pc_python else None}")
             print(f"  LLG RHS calls          : {hef.LLGStep}")
 
         return y, ctx, elapsed
