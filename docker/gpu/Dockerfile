@@ -18,6 +18,7 @@ ARG UFL_VERSION=2025.2.0
 ARG FFCX_VERSION=v0.10.1
 
 ARG ADIOS2_VERSION=v2.10.2
+
 ARG NANOBIND_VERSION=2.12.0
 
 # -----------------------------------------------------------------------------
@@ -57,6 +58,7 @@ ENV CMAKE_PREFIX_PATH=${ADIOS2_DIR}:/opt/fenicsx:${PETSC_DIR}/${PETSC_ARCH}:${CM
 ENV PYTHONPATH=${ADIOS2_DIR}/lib/python3.12/site-packages:${PYTHONPATH}
 
 # Avoid CPU oversubscription when using MPI/PETSc.
+
 ENV OMP_NUM_THREADS=1
 ENV MKL_NUM_THREADS=1
 ENV OPENBLAS_NUM_THREADS=1
@@ -121,7 +123,7 @@ RUN python3 -m venv ${VIRTUAL_ENV} && \
         scipy \
         pybind11 \
         "nanobind==${NANOBIND_VERSION}" \
-	    "scikit-build-core[pyproject]>=0.10" \
+	"scikit-build-core[pyproject]>=0.10" \
         mpi4py
 
 # -----------------------------------------------------------------------------
@@ -306,12 +308,14 @@ print("adios2 file:", getattr(adios2, "__file__", "no __file__"))
 PY
 
 # -----------------------------------------------------------------------------
-# adios4dolfinx against the MPI-enabled ADIOS2 from source
-#
-# --no-deps is intentional. Otherwise pip may install its own adios2 wheel, which
-# may not be MPI-enabled and can shadow the source-built ADIOS2 binding.
+# adios4dolfinx is pinned to the release line compatible with DOLFINx 0.10.
+# ADIOS2 itself is provided by the MPI-enabled source build above.
 # -----------------------------------------------------------------------------
-RUN python -m pip install --no-deps adios4dolfinx
+ARG ADIOS4DOLFINX_VERSION=0.10.0.post1
+
+RUN python -m pip install \
+        "adios4dolfinx==${ADIOS4DOLFINX_VERSION}" && \
+    python -m pip check
 
 # -----------------------------------------------------------------------------
 # ADIOS2 build-time test
@@ -338,12 +342,22 @@ print("ADIOS2 imported successfully.")
 print("adios4dolfinx import must be tested at runtime with --gpus all.")
 PY
 
+ARG JAX_VERSION=0.11.0
+ARG JAXFMM_VERSION=0.3.3
+
 # -----------------------------------------------------------------------------
 # Optional JAX and JAXFMM
+#
+# SpinFEMx uses the stable jaxfmm.apps.mag.strayfield API. The CUDA-12 JAX
+# wheel is selected explicitly because this image is based on CUDA 12.6.
 # -----------------------------------------------------------------------------
 RUN if [ "${INSTALL_JAX}" = "true" ]; then \
-        python -m pip install --upgrade "jax[cuda12]" && \
-        python -m pip install "git+https://gitlab.com/jaxfmm/jaxfmm.git@strayfield" ; \
+        python -m pip install \
+            "jax[cuda12]==${JAX_VERSION}" && \
+        python -m pip install \
+            --no-deps \
+            "jaxfmm==${JAXFMM_VERSION}" && \
+        python -m pip check ; \
     else \
         echo "Skipping JAX/JAXFMM installation" ; \
     fi
@@ -415,7 +429,16 @@ try:
 except Exception as e:
     print("adios2 import failed:", repr(e))
 
-for pkg in ["adios4dolfinx", "dolfinx", "petsc4py"]:
+for pkg in [
+    "adios4dolfinx",
+    "dolfinx",
+    "petsc4py",
+    "jax",
+    "jaxlib",
+    "jaxfmm",
+    "jax-cuda12-plugin",
+    "jax-cuda12-pjrt",
+]:
     try:
         print(f"{pkg} installed version:", metadata.version(pkg))
     except Exception as e:
