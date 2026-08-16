@@ -20,6 +20,7 @@ __all__ = [
     "DMIInterfacial",
     "DemagFieldFMMJAXGPU",
     "DemagFieldLindholmGPU",
+    "load_mesh_xdmf"
 ]
 
 
@@ -49,8 +50,8 @@ def __getattr__(name: str):
         return AnisotropyField
 
     if name == "CubicAnisotropyField":
-        from .fields.Cubic_Anisotropy_GPU import CubicAnisotropyField
-        return CubicAnisotropyField
+        from .fields.Cubic_Anisotropy_GPU import CubicAnisotropyFieldGPU
+        return CubicAnisotropyFieldGPU
 
     if name == "DMIBULK":
         from .fields.DMI_Bulk_GPU import DMIBULK
