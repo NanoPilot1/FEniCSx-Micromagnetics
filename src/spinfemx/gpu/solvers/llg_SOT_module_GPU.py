@@ -104,6 +104,66 @@ def _require_single_rank_gpu(mesh, backend_name: str) -> None:
 
 
 
+
+def _resolve_ksp_pc_configuration(
+    pc_side: str,
+    pc_norm_type: str,
+):
+    """Resolve and validate the Krylov preconditioning convention.
+
+    A Python block preconditioner changes the scaling of the residual.  For
+    nonlinear time stepping the safest default is right preconditioning with
+    the unpreconditioned residual norm, so the KSP stopping test remains tied
+    to the true linear residual rather than to a spatially varying block
+    scaling.
+    """
+    side_key = str(pc_side).strip().lower()
+    side_aliases = {
+        "left": "left",
+        "l": "left",
+        "right": "right",
+        "r": "right",
+    }
+    if side_key not in side_aliases:
+        raise ValueError(
+            "pc_side must be 'left' or 'right'. "
+            f"Received {pc_side!r}."
+        )
+    side_key = side_aliases[side_key]
+
+    norm_key = str(pc_norm_type).strip().lower().replace("-", "_")
+    norm_aliases = {
+        "preconditioned": "preconditioned",
+        "pc": "preconditioned",
+        "unpreconditioned": "unpreconditioned",
+        "true": "unpreconditioned",
+        "true_residual": "unpreconditioned",
+    }
+    if norm_key not in norm_aliases:
+        raise ValueError(
+            "pc_norm_type must be 'preconditioned' or 'unpreconditioned'. "
+            f"Received {pc_norm_type!r}."
+        )
+    norm_key = norm_aliases[norm_key]
+
+    if side_key == "right" and norm_key != "unpreconditioned":
+        raise ValueError(
+            "Right-preconditioned GMRES must use the unpreconditioned "
+            "(true) residual norm in this solver."
+        )
+
+    side_value = {
+        "left": PETSc.PC.Side.LEFT,
+        "right": PETSc.PC.Side.RIGHT,
+    }[side_key]
+    norm_value = {
+        "preconditioned": PETSc.KSP.NormType.PRECONDITIONED,
+        "unpreconditioned": PETSc.KSP.NormType.UNPRECONDITIONED,
+    }[norm_key]
+
+    return side_key, norm_key, side_value, norm_value
+
+
 # Fused CuPy kernels: RHS, Jv and local PC
 
 
@@ -1155,7 +1215,7 @@ class JvContextSOT:
         self.i10 = cp.empty(n); self.i11 = cp.empty(n); self.i12 = cp.empty(n)
         self.i20 = cp.empty(n); self.i21 = cp.empty(n); self.i22 = cp.empty(n)
 
-    def update_pc_full_fast_gpu(self, shift, use_abs_diag=True):
+    def update_pc_full_fast_gpu(self, shift, use_abs_diag=False):
         self.shift = float(shift)
         local_size = self.hef.local_size
 
@@ -1422,12 +1482,25 @@ class LLG_SOT_GPU:
         check_every_stop=10,
         stop_print=False,
         pc_python=True,
+        pc_use_abs_diag=False,
+        pc_side="right",
+        pc_norm_type="unpreconditioned",
     ):
         if self.hef is None:
             self._build_effective_field()
         hef = self.hef
         if m0_array is not None:
             hef.set_m_from_cpu(m0_array)
+
+        (
+            pc_side_key,
+            pc_norm_key,
+            pc_side_value,
+            pc_norm_value,
+        ) = _resolve_ksp_pc_configuration(
+            pc_side=pc_side,
+            pc_norm_type=pc_norm_type,
+        )
 
         ts = PETSc.TS().create(self.mesh.comm)
         opts = PETSc.Options()
@@ -1481,7 +1554,13 @@ class LLG_SOT_GPU:
             hef.current_time = float(t)
             hef.update_jac_state_SOT(y)
             if pc_python:
-                ctx.update_pc_full_fast_gpu(float(shift), use_abs_diag=True)
+                # diagK is the signed diagonal of dH/dm.  Taking its absolute
+                # value reverses the exchange-field sign and produces an
+                # anti-preconditioner on the racetrack problem.
+                ctx.update_pc_full_fast_gpu(
+                    float(shift),
+                    use_abs_diag=bool(pc_use_abs_diag),
+                )
             else:
                 ctx.shift = float(shift)
             return PETSc.Mat.Structure.SAME_NONZERO_PATTERN
@@ -1490,6 +1569,31 @@ class LLG_SOT_GPU:
         ts.setIFunction(hef.ifunction_SOT, F_gpu)
         ts.setIJacobian(IJac, J, J)
         ts.setFromOptions()
+
+        # Apply the explicit API choice after PETSc options have been parsed.
+        # This prevents ambient PETSc options from silently replacing the
+        # preconditioner requested through solve(...).  Right preconditioning
+        # preserves the true residual b-Ax; the signed local block remains fixed
+        # during each individual KSP solve.
+        ksp = ts.getSNES().getKSP()
+        pc = ksp.getPC()
+        if pc_python:
+            ctx.enable_pc = True
+            pc.setType(PETSc.PC.Type.PYTHON)
+            pc.setPythonContext(ctx)
+            ksp.setPCSide(pc_side_value)
+            ksp.setNormType(pc_norm_value)
+        else:
+            ctx.enable_pc = False
+            pc.setType(PETSc.PC.Type.NONE)
+            ksp.setNormType(PETSc.KSP.NormType.UNPRECONDITIONED)
+
+        self._pc_bdf_config = {
+            "enabled": bool(pc_python),
+            "use_abs_diag": bool(pc_use_abs_diag),
+            "side": pc_side_key if pc_python else "none",
+            "norm_type": pc_norm_key if pc_python else "unpreconditioned",
+        }
 
         y = _dup_cuda_vec(hef.m_gpu, block_size=3)
         hef.m_gpu.copy(y)
@@ -1633,6 +1737,9 @@ class LLG_SOT_GPU:
         stop_print=False,
         return_stats=False,
         pc_python=True,
+        pc_use_abs_diag=False,
+        pc_side="right",
+        pc_norm_type="unpreconditioned",
     ):
         self._ensure_solver_bdf(
             m0_array=m0_array,
@@ -1646,6 +1753,9 @@ class LLG_SOT_GPU:
             check_every_stop=check_every_stop,
             stop_print=stop_print,
             pc_python=pc_python,
+            pc_use_abs_diag=pc_use_abs_diag,
+            pc_side=pc_side,
+            pc_norm_type=pc_norm_type,
         )
 
         ts = self.ts
@@ -1690,12 +1800,25 @@ class LLG_SOT_GPU:
             "dt_last": float(ts.getTimeStep()),
             "nsteps": int(ts.getStepNumber()),
             "reason": int(ts.getConvergedReason()),
+            "step_rejections": int(ts.getStepRejections()),
+            "snes_failures": int(ts.getSNESFailures()),
+            "snes_iterations": int(ts.getSNESIterations()),
+            "ksp_iterations": int(ts.getKSPIterations()),
             "maxdmdt_deg_ns": (
                 float(self.stopper.last_max_dmdt_deg_ns)
                 if self.stopper is not None else float("nan")
             ),
             "jv_calls": getattr(self.ctx, "calls", None),
             "pc_calls": getattr(self.ctx, "callsPre", None),
+            "pc_enabled": bool(pc_python),
+            "pc_use_abs_diag": (
+                bool(pc_use_abs_diag) if pc_python else None
+            ),
+            "pc_side": (
+                self._pc_bdf_config["side"]
+                if pc_python else "none"
+            ),
+            "ksp_norm_type": self._pc_bdf_config["norm_type"],
         }
 
         if save_final_state and _HAVE_ADIOS:
@@ -1709,8 +1832,15 @@ class LLG_SOT_GPU:
             print("t_end:", stats["t_end"])
             print("dt_last:", stats["dt_last"])
             print("reason:", stats["reason"])
+            print("step rejections:", stats["step_rejections"])
+            print("SNES failures:", stats["snes_failures"])
+            print("SNES iterations:", stats["snes_iterations"])
+            print("KSP iterations:", stats["ksp_iterations"])
             print("Jv calls:", stats["jv_calls"])
             print("PC calls:", stats["pc_calls"])
+            print("PC side:", stats["pc_side"])
+            print("KSP norm:", stats["ksp_norm_type"])
+            print("PC abs(diag):", stats["pc_use_abs_diag"])
             print("wall-clock:", elapsed)
             if save_final_state and not _HAVE_ADIOS:
                 print("[SOT-GPU] adios4dolfinx unavailable: BP checkpoint skipped.")
