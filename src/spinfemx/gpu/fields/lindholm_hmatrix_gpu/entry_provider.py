@@ -61,9 +61,7 @@ def _fill_lindholm_block_triangle_numba(
     incident to at least one block column) exactly once, evaluates the three
     Lindholm weights (w0, w1, w2) of that triangle a single time, and scatters
     each weight to the in-block column carried by the corresponding triangle
-    vertex.  This replaces the previous incidence loop, which re-evaluated the
-    same (target, triangle) weight tuple once per shared column (up to three
-    times for an interior triangle).  Result is bit-for-bit the same
+    vertex.   Result is bit-for-bit the same
     accumulation; only the evaluation count drops.
 
     rel_tri  : (T,) global triangle indices touching the column set.
