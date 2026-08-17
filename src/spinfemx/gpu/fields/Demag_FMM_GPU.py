@@ -288,8 +288,8 @@ class DemagFieldFMMJAXGPU:
         Scalar or per-triangle surface saturation magnetization. Defaults to
         the volume ``Ms`` used by SpinFEMx.
     mem_limit:
-        JAXFMM batch-memory budget in bytes. Historical SpinFEMx defaults of
-        2,000,000 and 4,000,000 are replaced by a conservative 512 MiB budget.
+        JAXFMM batch-memory budget in bytes.
+        
     orientation_batch_size:
         Number of tetrahedra processed per CPU orientation batch.
     release_cupy_pool_before_plan:
