@@ -440,9 +440,8 @@ class DemagFieldLindholmGPU:
             # block in ``_gpu_far_blocks``.  Direct packing avoids one host to
             # device copy, but for large problems it can leave several GiB of
             # now-unused allocations cached in the CuPy pool immediately before
-            # PETSc TS starts.  The host factors already exist because they are
-            # required by the persistent cache, so the stable default reproduces
-            # the historical packed layout without giving up GPU construction.
+            # PETSc TS starts.  
+            
             if not bool(hmatrix_direct_gpu_pack):
                 transient_blocks = getattr(
                     self.B_hmatrix_cpu,
