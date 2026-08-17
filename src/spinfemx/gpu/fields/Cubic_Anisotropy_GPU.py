@@ -34,8 +34,6 @@ class CubicAnisotropyFieldGPU:
     """
     GPU cubic anisotropy field.
 
-    This implementation matches the sign convention of your CPU class:
-
         H_cubic = + 2 K1 / (mu0 Ms) *
                   [ s1 u1 + s2 u2 + s3 u3 ]
 
