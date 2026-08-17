@@ -20,7 +20,7 @@ The CPU backend includes:
 
 For larger CPU/MPI simulations, the CPU Docker image provides PETSc with Htool support for hierarchical-matrix acceleration of dense or boundary-integral components.
 
-The GPU backend includes CUDA-oriented implementations and computes the demagnetizing field using the FEM/BEM approach with either a dense GPU boundary operator for small systems or a custom compressed H-matrix backend for larger systems. Optionally, is possible to use JAXFMM, a third-party JAX-based fast multipole method library, that is useful por large system.
+The GPU backend includes CUDA-oriented implementations and computes the demagnetizing field using the FEM/BEM approach with either a dense GPU boundary operator for small systems or a custom compressed H-matrix backend for larger systems. Optionally, is possible to use JAXFMM, a third-party JAX-based fast multipole method library, that is useful for large system.
 
 ---
 
